@@ -1,0 +1,13 @@
+# Append to /etc/fail2ban/jail.local
+#
+# Bans any IP the WAF flags 3+ times within 10 minutes, for 1 hour.
+# Tune findtime / maxretry / bantime to taste.
+
+[phpwaf]
+enabled  = true
+filter   = phpwaf
+logpath  = /var/www/yoursite/waf/waf_storage/attacks.log
+maxretry = 3
+findtime = 600
+bantime  = 3600
+# action  = nftables-multiport   # or iptables-multiport on older systems
