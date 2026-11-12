@@ -1,0 +1,6 @@
+waf_storage/*
+!waf_storage/index.php
+__pycache__/
+*.pyc
+*.log
+.phpwaf-*.tmp.php

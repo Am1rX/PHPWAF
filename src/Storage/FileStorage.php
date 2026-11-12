@@ -16,8 +16,8 @@ final class FileStorage implements StorageInterface
 
     public function __construct(string $dir, int $gcProbability = 20)
     {
-        if (!is_dir($dir)) {
-            mkdir($dir, 0700, true);
+        if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+            throw new \RuntimeException('Cannot create IP storage directory.');
         }
         $this->hardenDir($dir);
         $this->blockFile     = $dir . '/blocked_ips.json';
@@ -68,17 +68,26 @@ final class FileStorage implements StorageInterface
 
     public function getBlock(string $ip): ?array
     {
-        $result = null;
-        $this->withLock($this->blockFile, function (array &$data) use ($ip, &$result): void {
-            if (isset($data[$ip])) {
-                if (time() < $data[$ip]['expires']) {
-                    $result = ['reason' => (string) $data[$ip]['reason'], 'expires' => (int) $data[$ip]['expires']];
-                } else {
-                    unset($data[$ip]); // expired -> clean up opportunistically
-                }
+        if (!is_file($this->blockFile)) {
+            return null;
+        }
+        $fp = @fopen($this->blockFile, 'rb');
+        if ($fp === false) {
+            throw new \RuntimeException('Cannot open IP state.');
+        }
+        try {
+            if (!flock($fp, LOCK_SH)) {
+                throw new \RuntimeException('Cannot read IP state.');
             }
-        });
-        return $result;
+            $data = json_decode((string) stream_get_contents($fp), true);
+            $block = $data[$ip] ?? null;
+            if (is_array($block) && isset($block['reason'], $block['expires']) && time() < (int) $block['expires']) {
+                return ['reason' => (string) $block['reason'], 'expires' => (int) $block['expires']];
+            }
+            return null;
+        } finally {
+            fclose($fp);
+        }
     }
 
     public function name(): string
@@ -113,9 +122,9 @@ final class FileStorage implements StorageInterface
      */
     private function withLock(string $file, callable $mutator): void
     {
-        $fp = fopen($file, 'c+');
+        $fp = @fopen($file, 'c+');
         if ($fp === false) {
-            return;
+            throw new \RuntimeException('Cannot open IP state.');
         }
         if (flock($fp, LOCK_EX)) {
             $size    = (int) (fstat($fp)['size'] ?? 0);
@@ -140,7 +149,7 @@ final class FileStorage implements StorageInterface
     {
         $htaccess = $dir . '/.htaccess';
         if (!file_exists($htaccess)) {
-            file_put_contents(
+            @file_put_contents(
                 $htaccess,
                 "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n"
                 . "<IfModule !mod_authz_core.c>\n    Order Deny,Allow\n    Deny from all\n</IfModule>\n"
@@ -148,7 +157,7 @@ final class FileStorage implements StorageInterface
         }
         $index = $dir . '/index.php';
         if (!file_exists($index)) {
-            file_put_contents($index, "<?php http_response_code(403); exit('Access Denied');");
+            @file_put_contents($index, "<?php http_response_code(403); exit('Access Denied');");
         }
     }
 }

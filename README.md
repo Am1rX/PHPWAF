@@ -1,280 +1,192 @@
-# PHP-WAF
+# PHPWAF
 
-A lightweight, dependency-free Web Application Firewall for PHP applications. Drop in **one line** and every request is inspected for XSS, SQL injection, command injection, path traversal, and scanner behavior before it reaches your code.
+PHPWAF inspects requests before they reach a PHP application. Use the browser console to attach the firewall to approved PHP entry points, review security events, tune signatures, and manage scoped exceptions.
 
-It is designed to be **operationally honest**: it can run in monitor mode before it ever blocks anything, it logs every decision in a machine-readable format, and it can push blocks all the way out to nginx or your firewall so blocked traffic never costs you a PHP worker.
+[راهنمای فارسی نصب و فعال‌سازی](README.fa.md)
 
-> This is a focused, embeddable layer — not a replacement for [ModSecurity + the OWASP Core Rule Set](https://owasp.org/www-project-modsecurity-core-rule-set/). Use it where you want signature + behavioral protection inside the app with near-zero setup, or as defense-in-depth alongside a full WAF.
+![PHPWAF dashboard showing active protection, connected PHP entry points, and recent events](docs/images/dashboard.png)
 
----
+## Choose an installation method
 
-## Why this exists
+| Hosting setup | Installation | Activation |
+| --- | --- | --- |
+| PHP hosting with SSH or a hosting terminal | [Install on a PHP host](#install-on-a-php-host) | Dashboard → Enable firewall |
+| WordPress | [Install on WordPress](#install-on-wordpress) | Dashboard → Enable firewall |
+| Hosting with File Manager and HTTPS | [Install with File Manager only](#install-with-file-manager-only) | Dashboard → Enable firewall |
+| Existing server-managed PHP configuration | [Standalone integration](#standalone-integration) | Front controller include or PHP auto-prepend |
 
-Most hand-rolled PHP firewalls share three problems. This project fixes each:
+### Requirements
 
-| Common problem | What this does instead |
+- PHP 8.0 or newer with <code>mbstring</code> and <code>json</code>. Redis and APCu are optional.
+- Managed installation needs HTTPS in production. PHP's development server can be used on loopback for local tests.
+- Keep the package and state outside the document root. The PHP account needs read access to the package and write access to the private state, the selected PHP entry points, and their parent directories.
+- Managed activation checks existing includes. Remove any earlier manual PHPWAF include or PHPWAF auto-prepend setting before activating the managed hooks.
+
+## Install on a PHP host
+
+1. Download the source archive and extract it. Name the package folder <code>waf</code> and place it beside the site's public directory.
+2. In SSH or the hosting terminal, run the installer under the site's PHP account. Replace the sample paths with your own. Add an <code>--entry</code> argument for each PHP script that serves requests directly.
+
+   ~~~bash
+   php /home/ACCOUNT/waf/admin/setup.php \
+     --root=/home/ACCOUNT/public_html \
+     --state=/home/ACCOUNT/waf-private \
+     --entry=index.php
+   ~~~
+
+3. Save the first-sign-in setup code printed in the terminal and follow [First sign-in and activation](#first-sign-in-and-activation).
+
+## Install on WordPress
+
+Use the directory containing WordPress's <code>index.php</code> and <code>wp-login.php</code> as the site root. A WordPress site in a subdirectory uses that subdirectory as the site root and still keeps PHPWAF and its state outside the whole public document root.
+
+### With a terminal
+
+List the PHP files you want PHPWAF to cover. This example includes the public front controller, login, editor, AJAX, cron, and XML-RPC entry points.
+
+~~~bash
+php /home/ACCOUNT/waf/admin/setup.php \
+  --root=/home/ACCOUNT/public_html \
+  --state=/home/ACCOUNT/waf-private \
+  --entry=index.php \
+  --entry=wp-login.php \
+  --entry=wp-admin/index.php \
+  --entry=wp-admin/post.php \
+  --entry=wp-admin/admin-ajax.php \
+  --entry=wp-cron.php \
+  --entry=xmlrpc.php
+~~~
+
+### With File Manager
+
+Follow [Install with File Manager only](#install-with-file-manager-only) and select **WordPress**. The profile selects existing files from the entry list above. Enter any additional publicly callable PHP scripts one per line.
+
+After a WordPress core update, check **Installation Status** for entries whose hooks were replaced. Use **Disable firewall** followed by **Enable firewall** to reattach the approved entries. Review login, editor, form, upload, and checkout activity in Monitor mode before enforcing on a site with plugins.
+
+## Install with File Manager only
+
+Use your hosting account's File Manager to put the files in this layout. The installer creates <code>waf-private</code>.
+
+~~~text
+/home/ACCOUNT/
+  waf/
+    admin/
+    examples/
+    src/
+    guard.php
+  phpwaf-setup.key
+  public_html/
+    index.php
+    phpwaf-install.php
+~~~
+
+1. Upload and extract the package outside <code>public_html</code>. Name the extracted package folder <code>waf</code>.
+2. Open the bundled [offline key generator](examples/setup-key.html) locally after extracting the archive, or generate a random 48-character key in a password manager. Create <code>phpwaf-setup.key</code> beside <code>waf</code> and paste the key on one line. Keep the file outside the document root.
+3. Copy [examples/phpwaf-install.php](examples/phpwaf-install.php) into the site's public directory. If your site is in a subfolder such as <code>public_html/blog</code>, edit <code>$private</code> in that copy to your account's absolute private directory, for example <code>/home/ACCOUNT</code>.
+4. Open <code>https://your-domain.example/phpwaf-install.php</code> in a browser. For a site in a subdirectory, use the corresponding path. Enter the private installation key and select **PHP website** or **WordPress**.
+5. For a PHP site, an empty entry list selects <code>index.php</code>. For WordPress, the installer includes the standard entry points listed above. Enter extra paths relative to the site directory, one per line.
+6. Select **Install**. Copy the **first-sign-in setup code** from the result screen. The installation key authorizes the installer, and the setup code authorizes the first panel sign-in.
+7. After saving the setup code, remove the public installer and its private key in File Manager. Follow [First sign-in and activation](#first-sign-in-and-activation).
+
+![File Manager installer showing the private-key field, site type, and PHP entry points](docs/images/file-manager-install.png)
+
+The installer locks itself after successful setup. On hosts where File Manager or PHP cannot access a private directory outside the web root, ask the host for a private path and the required permissions before setting up the managed panel.
+
+## First sign-in and activation
+
+1. Open <code>/firewall-admin/index.php</code> on the site over HTTPS.
+2. Sign in with <code>admin / admin</code> and the setup code shown by the installer. On the PHP development server running directly on loopback, the initial sign-in can use the local flow.
+3. Set a strong password of 16–72 bytes. The username may remain <code>admin</code>. The console unlocks after the password changes, and the setup code is discarded.
+4. On **Dashboard → Installation Status**, choose **Monitor** and save the mode using your current password. Select **Enable firewall** and confirm that the approved files show **Attached**.
+5. Test ordinary site workflows and review the attack log. Select **Filter** when you are ready to block matching requests. Select **Enforce** if you also want per-IP state and temporary bans.
+
+![First sign-in requires setting a new password before the console unlocks](docs/images/first-sign-in.png)
+
+**Disable firewall** stops inspection and removes the exact managed blocks from the selected files. Other application edits stay in place. If a host rejects writes or an entry conflicts with a manual include, the dashboard reports the affected files.
+
+English is the default language. Select **فارسی** on the sign-in page or in the console header for Persian.
+
+## Console features
+
+| Section | Controls |
 | --- | --- |
-| Blocked IPs still hit PHP on every request (a self-inflicted DoS) | Optionally writes blocks to an **nginx denylist** / **fail2ban**, dropping them at the edge |
-| State stored in JSON files that lock and grow under load | **Redis / APCu** backends with native TTLs; file storage only as a fallback |
-| Rules ship straight to "block" and break real users | **Monitor mode** + per-rule IDs + a **benchmark** that measures false positives |
+| Dashboard | Connected entry points, recent events, common rules, inspection mode, and enable or disable controls |
+| Attack Log | Search by IP, path, rule, or reference. Filter by method and action. Inspect the reason and bounded evidence beside the table |
+| Signatures | Filter, inspect, and enable or disable built-in rules individually |
+| Exceptions | Add an exception from a blocked event and review, expire, or remove it |
+| Access Management | Rotate credentials, manage an optional IP/CIDR allowlist, and review administrator activity |
 
----
+![Attack log with request filters and a selected event's evidence in a side panel](docs/images/attack-log.png)
 
-## Features
+An exception applies to the same rule, method, path, source, field, and exact value. PHPWAF stores a keyed fingerprint of the value and expires the exception after 1–30 days. Recognized sensitive fields and headers are redacted. Keep the private log directory outside the document root.
 
-- **Layered detection** — signature rules *plus* a behavioral model that accumulates a suspicion score across requests, so slow scanners get caught even when no single request crosses the line.
-- **Monitor vs. enforce** — run in `monitor` to log decisions without blocking while you tune, then flip to `enforce`.
-- **Pluggable storage** — `auto` selects Redis → APCu → file. Redis uses `INCRBY`+`EXPIRE` (atomic, no locks, no GC, multi-server).
-- **Edge blocking** — optional nginx `geo` denylist and fail2ban filter so bans happen before PHP-FPM.
-- **Honeypot fields** — hidden form inputs that bots fill and humans never see → instant block, zero false positives.
-- **Structured logging** — JSON Lines for SIEM/ELK + a fail2ban-friendly text log. Every block records which rule IDs fired.
-- **Evasion-aware normalization** — multi-layer URL decoding, HTML-entity decoding, comment stripping, null-byte removal, Unicode-safe lowercasing.
-- **ReDoS-hardened rules** — patterns match openers, not unbounded bodies; input is capped by length/depth/key count.
-- **IPv4 + IPv6** throughout, including CIDR whitelists and trusted-proxy handling.
+![Signatures table with status, score, and controls for the selected rule](docs/images/signatures.png)
 
----
+Per-rule changes, exceptions, mode changes, and access changes require the current password. A rule in shadow mode records evidence without contributing to the blocking score. The <code>PROBE-001</code> punctuation-only rule remains observation-only when enabled.
 
-## Architecture
+## Inspection and storage
 
-```
-            ┌──────────────┐   blocked?   ┌─────────────────────┐
-  request → │  nginx (geo) │ ───────────→ │  403 at the edge     │
-            └──────┬───────┘   (optional) └─────────────────────┘
-                   │ allowed
-                   ▼
-            ┌──────────────┐
-            │   guard.php  │   ← one require() in your front controller
-            └──────┬───────┘
-                   ▼
-   Normalizer → Detector (signatures) → score
-                   │
-                   ├─ score ≥ block_threshold ───────────┐
-                   ├─ accumulated ≥ suspicion_threshold ──┤→ block + log + denylist
-                   └─ honeypot touched ───────────────────┘
-                   │
-   Storage (Redis │ APCu │ File)   Logger (JSONL + text)
-```
+| Mode | Behavior |
+| --- | --- |
+| Monitor | Records decisions while requests continue to the application |
+| Filter | Rejects individual matching requests without using a per-IP state store |
+| Enforce | Adds behavioral scoring and temporary IP bans using the configured store |
 
----
+PHPWAF inspects query, form, cookie, JSON, and selected request metadata under configurable limits for size, nesting, and field count. Default limits include 128 KiB of JSON, 8 KiB per inspected key or value, and 256 KiB of aggregate inspected input. An exceeded budget returns <code>413</code> in blocking modes. Invalid JSON sent as JSON returns <code>400</code>. File upload contents require validation by the application.
 
-## Requirements
+The built-in rules cover common XSS, SQL injection, command injection, and path traversal patterns. Configure disabled and shadow rules, inspection limits, honeypots, proxy trust, and IP allowlists in [config.php](config.php). Monitor legitimate traffic when tuning a site.
 
-- PHP **8.0+** with `mbstring` and `json`
-- Optional: `redis` extension (recommended in production) or `apcu`
-- No Composer, no third-party packages
+In Enforce mode, the storage selector supports Redis, APCu, and a file fallback. JSONL logs include event references, rule IDs, and bounded request metadata. The optional [nginx denylist](examples/nginx.conf) and [fail2ban examples](examples/fail2ban/) can enforce bans upstream. nginx denylist entries remain until pruned and the configuration is reloaded. fail2ban can apply timed bans using its own configuration.
 
----
+## Standalone integration
 
-## Install
+Place the package outside the document root and give PHP write access to <code>waf_storage</code>. For a PHP app with a single front controller, insert this before application output and after any leading PHP declarations.
 
-Copy the `waf/` folder into your project, then add a single line at the very top of your front controller (e.g. `public/index.php`), **before any other code**:
+~~~php
+require_once __DIR__ . '/../waf/guard.php';
+~~~
 
-```php
-require __DIR__ . '/waf/guard.php';
-```
+For server-wide coverage of PHP scripts, set an absolute <code>auto_prepend_file</code> path in the configuration your host uses.
 
-That's it. Defaults are safe. Everything else is configuration.
+~~~ini
+auto_prepend_file = "/home/ACCOUNT/waf/guard.php"
+~~~
 
-> **Tip:** deploy with `mode => 'monitor'` first (see below), watch `waf_storage/events.jsonl` for a day, then switch to `filter` or `enforce`.
+PHP-FPM hosts may accept this in <code>.user.ini</code>. For Apache with mod_php, use <code>php_value auto_prepend_file "/home/ACCOUNT/waf/guard.php"</code> in the appropriate Apache configuration. Use one integration method for the site. Standalone settings are read from <code>config.php</code>.
 
----
+## Response privacy
 
-## Activate it everywhere automatically (no per-file editing)
+Set <code>expose_php=Off</code>, <code>display_errors=Off</code>, <code>display_startup_errors=Off</code>, and <code>log_errors=On</code> in the active PHP configuration. See the [php.ini example](examples/auto_prepend/php.ini). PHPWAF strips common version and debug headers from PHP responses and returns plain-text block messages with a reference code.
 
-If you have a lot of PHP files and don't want to add the `require` line to each one, turn it on for the **whole site at once** with PHP's `auto_prepend_file`. Pick the one that matches your host — ready-made files are in [`examples/auto_prepend/`](examples/auto_prepend/):
+Apply server-header handling at the final HTTP hop. The [Caddy example](examples/Caddyfile) removes the <code>Server</code> header from ordinary responses, redirects, and edge errors. The [nginx example](examples/nginx.conf) hides PHP headers and suppresses nginx version numbers. Apache's <code>ServerTokens Prod</code> and <code>ServerSignature Off</code> suppress server version details. Any metadata generated in application HTML or JSON is controlled by the application.
 
-| Your host | Use this file | Put it where |
-| --- | --- | --- |
-| Shared hosting (cPanel/Plesk, PHP-FPM) | `.user.ini` | your web root (e.g. `public_html/`) |
-| Apache with mod_php | `.htaccess` | your web root |
-| VPS / dedicated (you control PHP) | `php.ini` snippet | your `php.ini`, then restart PHP |
+## Recovery and upgrades
 
-Each file just needs the **absolute path** to `guard.php`. To find it, drop a file containing `<?php echo __DIR__;` in your web root, open it in the browser (it prints e.g. `/home/youruser/public_html`), add `/waf/guard.php`, then delete that file.
+Back up the private state directory. It holds credentials, deployment settings, policy overrides, exceptions, and logs. The terminal installer offers <code>--settings=keep</code> and <code>--settings=reset</code> when reinstalling into existing state.
 
-With auto-prepend on, the WAF runs before every page automatically and you **don't** add any `require` line yourself. Use **either** auto-prepend **or** the manual `require` — not both.
+Use the hosting terminal to recover a lost administrator account. The owner can supply a strong username and password or start a fresh first-sign-in rotation.
 
-> `.user.ini` changes can take a few minutes to take effect and don't affect CLI scripts (which is what you want).
+~~~bash
+php /home/ACCOUNT/waf/admin/setup.php \
+  --state=/home/ACCOUNT/waf-private --reset-admin
+~~~
 
----
+For emergency shutdown from the terminal, use <code>--disable</code> with the same state path. To apply changes from <code>config.php</code> to an existing managed installation, use <code>--reload-engine</code>. Inspection mode and signature toggles are available in the console for File Manager installations.
 
-## Configuration
+## Tests
 
-All settings live in [`config.php`](config.php). The important ones:
-
-```php
-'mode' => 'enforce',           // 'monitor' to log only, 'enforce' to block
-
-'scoring' => [
-    'block_threshold'      => 15,   // single-request score that blocks immediately
-    'suspicion_threshold'  => 20,   // accumulated score (per window) that blocks
-    'time_window'          => 60,   // suspicion window, seconds
-    'block_duration'       => 300,  // how long a block lasts, seconds
-],
-
-'storage'  => ['driver' => 'auto'], // auto → redis → apcu → file
-'whitelist'=> ['203.0.113.0/24', '::1'],
-'honeypot_fields' => ['website_url'],
-'disabled_rules'  => [],            // e.g. ['SQLI-002'] if it's noisy for you
-```
-
-### Modes
-
-- **`monitor`** — inspects and logs the decision it *would* make, but never blocks. Use this to find false positives against real traffic before enforcing.
-- **`filter`** — blocks each malicious request with a 403, but **never bans the IP**. The same client can immediately send a clean request and be served. Stateless: it needs no storage and keeps no block list. Use this when you don't want to risk locking anyone out.
-- **`enforce`** — blocks the request *and* bans the offending IP for `block_duration`, with behavioral accumulation and optional edge denylist.
-
-| | logs | blocks the bad request | bans the IP | needs storage |
-| --- | :---: | :---: | :---: | :---: |
-| `monitor` | ✅ | ❌ | ❌ | ❌ |
-| `filter`  | ✅ | ✅ | ❌ | ❌ |
-| `enforce` | ✅ | ✅ | ✅ | ✅ |
-
-### Storage backends
-
-| Driver | Best for | Notes |
-| --- | --- | --- |
-| `redis` | Production, multi-server | `INCRBY`+`EXPIRE`, atomic, no locks, no manual cleanup |
-| `apcu`  | Single server | In-memory, fast, native TTLs |
-| `file`  | Anywhere / fallback | Atomic locked read-modify-write + GC; slowest under load |
-
-`auto` (default) picks the best available and **degrades gracefully** — if Redis is configured but unreachable, it falls back to file storage and logs a notice.
-
----
-
-## Edge blocking (recommended)
-
-Blocking inside PHP still means a blocked attacker wakes up a PHP worker on every request. Push the block outward.
-
-Set in config:
-
-```php
-'edge' => ['enabled' => true, 'denylist_file' => __DIR__ . '/waf_storage/denylist.conf'],
-```
-
-**Option A — nginx `geo` denylist.** See [`examples/nginx.conf`](examples/nginx.conf). The WAF appends `1.2.3.4 1;` lines; nginx returns 403 before PHP. Reload nginx on a cron to pick up new entries.
-
-**Option B — fail2ban (instant, reload-free).** Point fail2ban at the WAF's text log; it bans at iptables/nftables. See [`examples/fail2ban/`](examples/fail2ban/):
-
-```
-examples/fail2ban/phpwaf.conf  →  /etc/fail2ban/filter.d/phpwaf.conf
-examples/fail2ban/jail.local   →  append to /etc/fail2ban/jail.local
-```
-
----
-
-## Honeypot fields
-
-Add a hidden input no human will ever fill, and list its name in `honeypot_fields`. Any request that submits it non-empty is blocked instantly with zero false positives — bots fill every field they find. See the markup in [`public/index.php`](public/index.php):
-
-```html
-<div style="position:absolute;left:-9999px" aria-hidden="true">
-  <input name="website_url" tabindex="-1" autocomplete="off">
-</div>
-```
-
----
-
-## Logging
-
-Two logs are written to `waf_storage/`:
-
-- **`events.jsonl`** — one JSON object per line, ready for ELK/Grafana/Splunk:
-  ```json
-  {"ts":"2026-06-16T12:00:00+00:00","ip":"1.2.3.4","decision":"block","mode":"enforce","score":40,"rule_ids":["XSS-001","XSS-005"],"types":["Script tag","JS sink/function"],"method":"POST","uri":"/login"}
-  ```
-- **`attacks.log`** — human- and fail2ban-readable plaintext.
-
-Every decision records the rule IDs that fired, so you can see exactly *why* something was blocked and disable a noisy rule via `disabled_rules`.
-
----
-
-## Testing
-
-A benchmark ships with the project. It scores a corpus of real attack strings and benign strings and reports the two numbers that actually matter:
-
-```bash
+~~~text
 php tests/run.php
-```
+python tests/http_integration.py
+python tests/panel_integration.py
+python tests/web_install_integration.py
+python tests/edge_integration.py PATH_TO_CADDY PATH_TO_OPENSSL
+~~~
 
-```
-Detection rate:      100.0%  (20/20 attacks caught)
-False-positive rate:   0.0%  (0/20 benign flagged)
-```
+The integration tests use disposable services on loopback. They cover ordinary PHP, both installer profiles, first-sign-in rotation, mode changes, reversible hooks, privacy headers, scoped exceptions, and final-hop HTTP/TLS responses.
 
-Add your own real traffic samples to the benign list before enforcing — that's the fastest way to catch a rule that would hurt your users.
-
----
-
-## Rule reference
-
-| ID | Category | What it catches |
-| --- | --- | --- |
-| `XSS-001..005` | XSS | script tags, dangerous elements, event handlers, `javascript:`/`data:` protocols, JS sinks |
-| `SQLI-001..004` | SQL injection | `UNION SELECT`, `information_schema`, tautologies, comment truncation, stacked queries |
-| `LFI-001..002` | Traversal / LFI | `../`, `/etc/passwd`, PHP wrappers (`php://`, `phar://`) |
-| `RCE-001..002` | Command injection | shell verbs after metacharacters, `$()`, backticks, pipes to a shell |
-| `GEN-001..002` | Generic | context-break sequences, backtick exec |
-
-Each rule has a stable ID used in logs and in `disabled_rules`.
-
----
-
-## Tuning false positives
-
-1. Start in `monitor` mode.
-2. Watch `events.jsonl` for `decision:"monitor"` entries on legitimate traffic.
-3. Note the offending `rule_ids`.
-4. Either add the source to `whitelist`, or add the rule ID to `disabled_rules`.
-5. Re-run `php tests/run.php` after adding the false-positive string to the benign corpus.
-6. Switch to `enforce`.
-
-Endpoints that legitimately accept HTML/markup (rich-text editors) should be whitelisted or handled before `guard.php`.
-
----
-
-## Project layout
-
-```
-waf/
-├── guard.php             # one-line entry point
-├── autoload.php          # tiny PSR-4-style autoloader (no Composer)
-├── config.php            # all settings
-├── src/
-│   ├── Firewall.php      # orchestrator
-│   ├── Normalizer.php    # decode/canonicalize input
-│   ├── Detector.php      # signature rules (stable IDs)
-│   ├── Logger.php        # JSONL + text logging
-│   ├── DenyList.php      # nginx edge denylist writer
-│   └── Storage/
-│       ├── StorageInterface.php
-│       ├── RedisStorage.php
-│       ├── ApcuStorage.php
-│       ├── FileStorage.php
-│       └── StorageFactory.php
-├── public/
-│   ├── index.php         # demo protected page + honeypot form
-│   └── block.php         # generic 403 page (see below)
-├── tests/run.php         # detection + false-positive benchmark
-├── examples/             # nginx + fail2ban + auto_prepend (site-wide) configs
-└── waf_storage/          # runtime data (git-ignored)
-```
-
----
-
-## The block page
-
-[`public/block.php`](public/block.php) is intentionally generic. It returns a clean 403 and a reference code, and it **says nothing about a firewall** — telling an attacker they hit a WAF just helps them tune a bypass. Honest users can quote the reference code to support.
-
----
-
-## Limitations (read these)
-
-- **Signatures are bypassable by design.** This catches commodity attacks and scanners, not a determined, custom-tailored attacker. Layer it with a real WAF and good app-level validation.
-- **IP-based blocking has collateral** on shared/CGNAT addresses. Whitelist known-good ranges; consider blocking at session level for sensitive flows.
-- **Not a substitute for fixing the bug.** A WAF buys time; parameterized queries, output encoding, and input validation are the actual fix.
-
----
+The File Manager WordPress profile was also checked on WordPress 7.1.4 with MariaDB 10.4. The test exercised the public site, login, dashboard, REST reads, and saving a post through the editor API.
 
 ## License
 
-MIT. Use it, fork it, ship it.
+[MIT](LICENSE)

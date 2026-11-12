@@ -1,0 +1,53 @@
+# Replace example.com and the upstream address with your site configuration.
+(phpwaf_privacy) {
+	header {
+		-Server
+		-Host
+		-X-Powered-By
+		-X-PHP
+		-X-PHP-Version
+		-X-AspNet-Version
+		-X-AspNetMvc-Version
+		-X-WAF-Version
+		-X-Version
+		-X-Runtime
+		-X-Runtime-Version
+		-X-Application-Version
+		-X-Framework-Version
+		-X-Server-Version
+		-X-Backend-Version
+		-X-Generator
+		-X-Debug-Token
+		-X-Debug-Token-Link
+		-X-Profiler
+		-X-Backend-Server
+		-X-Served-By
+	}
+}
+
+(phpwaf_edge_errors) {
+	handle_errors {
+		route {
+			import phpwaf_privacy
+			header Cache-Control no-store
+			header Content-Type "text/plain; charset=utf-8"
+			respond "Request could not be processed." {err.status_code}
+		}
+	}
+}
+
+http://example.com {
+	route {
+		import phpwaf_privacy
+		redir https://example.com{uri} 308
+	}
+	import phpwaf_edge_errors
+}
+
+https://example.com {
+	route {
+		import phpwaf_privacy
+		reverse_proxy 127.0.0.1:8080
+	}
+	import phpwaf_edge_errors
+}

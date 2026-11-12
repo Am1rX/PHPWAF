@@ -16,7 +16,7 @@ return [
     //               Stateless: needs no storage and keeps no block list.
     //   'enforce' = block the request AND ban the IP for block_duration, with behavioral
     //               accumulation and optional edge denylist.
-    'mode' => 'enforce',
+    'mode' => 'filter',
 
     'scoring' => [
         // A single request scoring at/above this is blocked immediately.
@@ -45,8 +45,8 @@ return [
     ],
 
     'proxy' => [
-        // Only enable if a TRUSTED reverse proxy/CDN overwrites X-Forwarded-For.
-        // If clients can reach PHP directly, leave this false (the header is spoofable).
+        // Enable only for proxies that append the peer address or replace the header.
+        // List every proxy hop you operate, never end-user network ranges.
         'trust_forwarded_header' => false,
         'trusted_proxies'        => [],   // e.g. ['10.0.0.1', '172.16.0.0/12']
     ],
@@ -64,6 +64,8 @@ return [
         'max_depth'        => 15,
         'max_keys'         => 1000,
         'max_value_length' => 8192,
+        'max_json_bytes'   => 131072,
+        'max_scan_bytes'   => 262144,
     ],
 
     'logging' => [
@@ -83,6 +85,9 @@ return [
 
     // Rule IDs to switch off (e.g. ['SQLI-002'] if it proves noisy on your traffic).
     'disabled_rules' => [],
+
+    // Matches are logged with the decision "shadow" and add no enforcement score.
+    'shadow_rule_ids' => [],
 
     // Probability (1 in N) of running garbage collection on the file driver per request.
     'gc_probability' => 20,

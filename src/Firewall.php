@@ -4,28 +4,35 @@ declare(strict_types=1);
 
 namespace Waf;
 
+use LengthException;
+use Throwable;
+use UnexpectedValueException;
+use Waf\Admin\Policy;
 use Waf\Storage\StorageInterface;
 
 final class Firewall
 {
     /** @var array<string,mixed> */
     private array $config;
-    private StorageInterface $storage;
+    private ?StorageInterface $storage;
     private Detector $detector;
     private Normalizer $normalizer;
     private Logger $logger;
     private ?DenyList $denyList;
+    private ?Policy $policy;
+    private array $evidence = [];
 
     /**
      * @param array<string,mixed> $config
      */
     public function __construct(
         array $config,
-        StorageInterface $storage,
+        ?StorageInterface $storage,
         Detector $detector,
         Normalizer $normalizer,
         Logger $logger,
-        ?DenyList $denyList = null
+        ?DenyList $denyList = null,
+        ?Policy $policy = null
     ) {
         $this->config     = $config;
         $this->storage    = $storage;
@@ -33,197 +40,162 @@ final class Firewall
         $this->normalizer = $normalizer;
         $this->logger     = $logger;
         $this->denyList   = $denyList;
+        $this->policy     = $policy;
     }
 
     public function run(): void
     {
-        $ip   = $this->clientIp();
+        $ip = $this->clientIp();
         $mode = (string) $this->config['mode'];
-
-        if ($this->isWhitelisted($ip)) {
+        if ($ip !== null && $this->isWhitelisted($ip)) {
             return;
         }
 
-        // Mode capabilities:
-        //   monitor -> log only.
-        //   filter  -> reject the bad request (403) but never ban the IP. Stateless:
-        //              no block list, no behavioral accumulation, no storage needed.
-        //   enforce -> reject the request AND ban the IP, with behavioral accumulation.
-        $banning  = ($mode === 'enforce');                      // persist IP bans + accumulate
-        $blocking = ($mode === 'enforce' || $mode === 'filter'); // reject this request
-
-        // Only enforce keeps a persistent block list, so only enforce checks it.
-        if ($banning && $this->storage->isBlocked($ip)) {
-            $this->reject();
+        $storage = $mode === 'enforce' && $ip !== null ? $this->storage : null;
+        if ($storage !== null) {
+            try {
+                if ($storage->isBlocked($ip)) {
+                    $this->act($ip, $mode, 0, ['IP-BAN'], ['An existing IP ban is active'], 403);
+                }
+            } catch (Throwable $error) {
+                error_log('[PHPWAF] IP storage read failed. Inspecting without IP state.');
+                $storage = null;
+            }
         }
 
-        $inputs = $this->gatherInputs();
-
-        // Honeypot: hidden fields no real user fills. High confidence, zero false positives.
-        if ($this->honeypotTriggered($inputs)) {
-            $this->logger->logDecision($ip, $blocking ? 'block' : 'monitor', 999, ['HONEYPOT'], ['Honeypot field touched'], $mode);
-            if ($banning) {
-                $this->enforceBlock($ip, 'Honeypot field touched');
-            }
-            if ($blocking) {
-                $this->reject();
-            }
-            return;
-        }
-
+        $limits = $this->config['limits'];
         $score = 0;
         $rules = [];
         $types = [];
-
-        foreach ($this->flatten($inputs) as $value) {
-            $result = $this->detector->inspect($this->normalizer->normalize($value));
-            if ($result['score'] > 0) {
-                $score += $result['score'];
-                array_push($rules, ...$result['rules']);
-                array_push($types, ...$result['types']);
+        $shadowRules = [];
+        try {
+            $json = RequestInput::jsonBody($limits);
+            if ($this->honeypotTriggered($json)) {
+                $this->act($ip, $mode, 999, ['HONEYPOT'], ['Honeypot field touched'], 403, $storage);
+                return;
             }
-        }
 
-        $threshold = (int) $this->config['scoring']['block_threshold'];
-
-        // A single request at/above the threshold is rejected on its own (in filter/enforce).
-        if ($score >= $threshold) {
-            $this->logger->logDecision($ip, $blocking ? 'block' : 'monitor', $score, $rules, $types, $mode);
-            if ($banning) {
-                $this->enforceBlock($ip, "Immediate block (score $score)");
+            $input = new RequestInput($limits);
+            $sources = ['query' => $_GET, 'form' => $_POST, 'cookie' => $_COOKIE, 'json' => $json, 'path' => RequestInput::path(),
+                'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '', 'referer' => $_SERVER['HTTP_REFERER'] ?? ''];
+            foreach ($sources as $name => $source) {
+                if ($source === [] || $source === null || $source === '') {
+                    continue;
+                }
+                foreach ($input->values($source, 0, $this->policy === null ? null : '') as $field => $value) {
+                    $result = $this->detector->inspect($this->normalizer->normalize($value), $this->policy === null ? null
+                        : function (string $rule, string $match) use ($name, $field, $value): bool {
+                            $evidence = $this->policy->match($rule, $name, $field, $value, $match);
+                            if ($evidence === null) {
+                                return false;
+                            }
+                            if (count($this->evidence) < 16) {
+                                $this->evidence[] = $evidence;
+                            }
+                            return true;
+                        }, in_array($name, ['query', 'form', 'json'], true) && !str_ends_with($field, '/@key'));
+                    $score += $result['score'];
+                    foreach ($result['rules'] as $index => $id) {
+                        $rules[$id] = $result['types'][$index];
+                    }
+                    foreach ($result['shadow_rules'] as $id) {
+                        $shadowRules[$id] = true;
+                    }
+                }
             }
-            if ($blocking) {
-                $this->reject();
-            }
+        } catch (LengthException $error) {
+            $this->act($ip, $mode, 0, ['INPUT-LIMIT'], ['Inspection budget exceeded'], 413);
+            return;
+        } catch (UnexpectedValueException $error) {
+            $this->act($ip, $mode, 0, ['INPUT-INVALID'], ['Invalid request body'], 400);
             return;
         }
 
-        // Behavioral accumulation exists only to drive an IP ban, so it is enforce-only.
-        // In filter/monitor there is no per-IP state to keep.
-        if ($banning && $score > 0) {
-            $total = $this->storage->incrementSuspicion(
-                $ip,
-                $score,
-                (int) $this->config['scoring']['time_window']
-            );
+        if ($shadowRules !== []) {
+            $evidence = array_values(array_filter($this->evidence, static fn ($item) => isset($shadowRules[$item['rule']])));
+            $this->logger->logDecision($ip ?? '-', 'shadow', 0, array_keys($shadowRules), ['Observation-only match'],
+                $mode, Response::reference(), $evidence);
+        }
+        if ($score >= (int) $this->config['scoring']['block_threshold']) {
+            $this->act($ip, $mode, $score, array_keys($rules), array_values($rules), 403, $storage);
+            return;
+        }
 
-            if ($total >= (int) $this->config['scoring']['suspicion_threshold']) {
-                $this->storage->resetSuspicion($ip);
-                $this->logger->logDecision($ip, 'block', $total, $rules, $types, $mode);
-                $this->enforceBlock($ip, "Behavioral block (accumulated $total)");
-                $this->reject();
+        if ($storage !== null && $score > 0) {
+            try {
+                $total = $storage->incrementSuspicion($ip, $score, (int) $this->config['scoring']['time_window']);
+                if ($total >= (int) $this->config['scoring']['suspicion_threshold']) {
+                    $this->act($ip, $mode, $total, array_keys($rules), array_values($rules), 403, $storage);
+                }
+            } catch (Throwable $error) {
+                error_log('[PHPWAF] IP storage write failed. Inspecting without IP state.');
             }
         }
     }
 
-    private function enforceBlock(string $ip, string $reason): void
+    private function act(?string $ip, string $mode, int $score, array $rules, array $types, int $status, ?StorageInterface $storage = null): void
     {
-        $this->storage->block($ip, (int) $this->config['scoring']['block_duration'], $reason);
-        if ($this->denyList !== null) {
-            $this->denyList->add($ip);
+        $reference = Response::reference();
+        $monitor = $mode === 'monitor';
+        $decision = $monitor ? 'monitor' : ($status === 403 ? 'block' : 'reject');
+        $evidence = array_values(array_filter($this->evidence, static fn ($item) => in_array($item['rule'], $rules, true)));
+        $this->logger->logDecision($ip ?? '-', $decision, $score, $rules, $types, $mode, $reference, $evidence);
+        if ($monitor) {
+            return;
         }
-    }
-
-    private function reject(): void
-    {
-        http_response_code(403);
-        $ref = strtoupper(substr(bin2hex(random_bytes(4)), 0, 8));
-        // Generic page; does not advertise that a WAF is in place.
-        $page = __DIR__ . '/../public/block.php';
-        if (is_file($page)) {
-            $GLOBALS['waf_ref'] = $ref;
-            require $page;
-        } else {
-            echo 'Access denied. Reference: ' . $ref;
-        }
-        exit;
-    }
-
-    // ---- input collection ------------------------------------------------
-
-    /**
-     * @return array<string,mixed>
-     */
-    private function gatherInputs(): array
-    {
-        $data = $_REQUEST;
-
-        $raw = file_get_contents('php://input');
-        if ($raw !== false && $raw !== '') {
-            $json = json_decode($raw, true);
-            if (is_array($json)) {
-                $data = array_merge($data, $json);
+        if ($storage !== null && $ip !== null) {
+            try {
+                $storage->block($ip, (int) $this->config['scoring']['block_duration'], "Rule decision (score $score)");
+                $storage->resetSuspicion($ip);
+                if ($this->denyList !== null) {
+                    $this->denyList->add($ip);
+                }
+            } catch (Throwable $error) {
+                error_log('[PHPWAF] IP ban persistence failed.');
             }
         }
-
-        // A few high-signal headers (kept narrow to limit false positives).
-        foreach (['HTTP_USER_AGENT' => 'User-Agent', 'HTTP_REFERER' => 'Referer'] as $srv => $label) {
-            if (!empty($_SERVER[$srv])) {
-                $data[$label] = $_SERVER[$srv];
-            }
-        }
-
-        return $data;
+        Response::reject($status, $reference);
     }
 
-    /**
-     * @param array<string,mixed> $inputs
-     */
-    private function honeypotTriggered(array $inputs): bool
+    private function honeypotTriggered(mixed $json): bool
     {
         foreach ((array) $this->config['honeypot_fields'] as $field) {
-            if (isset($inputs[$field]) && trim((string) $inputs[$field]) !== '') {
-                return true;
+            foreach ([$_GET[$field] ?? null, $_POST[$field] ?? null, is_array($json) ? ($json[$field] ?? null) : null] as $value) {
+                if (is_array($value) ? $value !== [] : trim((string) $value) !== '') {
+                    return true;
+                }
             }
         }
         return false;
     }
 
-    /**
-     * Flatten nested input into "a.b.c" => value pairs, with self-protection caps.
-     *
-     * @param array<mixed> $array
-     * @return array<string,string>
-     */
-    private function flatten(array $array, string $prefix = '', int $depth = 0): array
+    private function clientIp(): ?string
     {
-        $limits = $this->config['limits'];
-        if ($depth > (int) $limits['max_depth']) {
-            return [];
+        $peer = $_SERVER['REMOTE_ADDR'] ?? '';
+        if (filter_var($peer, FILTER_VALIDATE_IP) === false) {
+            return null;
         }
-        $result = [];
-        foreach ($array as $key => $value) {
-            if (count($result) >= (int) $limits['max_keys']) {
-                break;
-            }
-            $newKey = $prefix === '' ? (string) $key : $prefix . '.' . $key;
-            if (is_array($value)) {
-                $result += $this->flatten($value, $newKey, $depth + 1);
-            } else {
-                $result[$newKey] = substr((string) $value, 0, (int) $limits['max_value_length']);
-            }
-        }
-        return $result;
-    }
-
-    // ---- client IP / whitelist ------------------------------------------
-
-    private function clientIp(): string
-    {
         $proxy = $this->config['proxy'];
-        if (
-            !empty($proxy['trust_forwarded_header'])
-            && isset($_SERVER['REMOTE_ADDR'])
-            && $this->ipMatchesAny($_SERVER['REMOTE_ADDR'], (array) $proxy['trusted_proxies'])
-            && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])
-        ) {
-            $parts     = explode(',', (string) $_SERVER['HTTP_X_FORWARDED_FOR']);
-            $candidate = trim($parts[0]);
-            if (filter_var($candidate, FILTER_VALIDATE_IP)) {
+        $trusted = (array) $proxy['trusted_proxies'];
+        if (empty($proxy['trust_forwarded_header']) || !$this->ipMatchesAny($peer, $trusted)) {
+            return $peer;
+        }
+
+        $forwarded = (string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? '');
+        if (strlen($forwarded) > 2048) {
+            return null;
+        }
+        $parts = explode(',', $forwarded);
+        for ($index = count($parts) - 1; $index >= 0; --$index) {
+            $candidate = trim($parts[$index]);
+            if (filter_var($candidate, FILTER_VALIDATE_IP) === false) {
+                return null;
+            }
+            if (!$this->ipMatchesAny($candidate, $trusted)) {
                 return $candidate;
             }
         }
-        return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        return null;
     }
 
     private function isWhitelisted(string $ip): bool
@@ -257,6 +229,9 @@ final class Firewall
             return false; // mixed families or invalid
         }
 
+        if ($bitsRaw === '' || !ctype_digit($bitsRaw)) {
+            return false;
+        }
         $bits = (int) $bitsRaw;
         $maxBits = strlen($ipBin) * 8;
         if ($bits < 0 || $bits > $maxBits) {

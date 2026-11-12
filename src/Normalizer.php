@@ -18,7 +18,7 @@ final class Normalizer
         $decoded = $input;
 
         // Peel up to N layers of URL encoding (e.g. %2527 -> %27 -> ').
-        for ($i = 0; $i < self::MAX_URL_DECODE_PASSES; $i++) {
+        for ($i = 0; $i < self::MAX_URL_DECODE_PASSES && strpos($decoded, '%') !== false; $i++) {
             $next = rawurldecode($decoded);
             if ($next === $decoded) {
                 break;
@@ -27,14 +27,18 @@ final class Normalizer
         }
 
         // Decode HTML entities (named, decimal, hex).
-        $decoded = html_entity_decode($decoded, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if (strpos($decoded, '&') !== false) {
+            $decoded = html_entity_decode($decoded, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
 
         // Strip null bytes used to truncate/confuse downstream parsers.
         $decoded = str_replace("\0", '', $decoded);
 
         // Collapse whitespace runs so "union/**/select" style padding is less effective
         // once comments are removed below.
-        $decoded = preg_replace('/\/\*.*?\*\//s', ' ', $decoded) ?? $decoded;
+        if (strpos($decoded, '/*') !== false) {
+            $decoded = preg_replace('/\/\*.*?\*\//s', ' ', $decoded) ?? $decoded;
+        }
 
         return mb_strtolower($decoded, 'UTF-8');
     }

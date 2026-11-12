@@ -13,11 +13,13 @@ final class Logger
 {
     private string $jsonLog;
     private string $textLog;
+    private int $maxBytes;
 
-    public function __construct(string $jsonLog, string $textLog)
+    public function __construct(string $jsonLog, string $textLog, int $maxBytes = 0)
     {
         $this->jsonLog = $jsonLog;
         $this->textLog = $textLog;
+        $this->maxBytes = $maxBytes;
     }
 
     /**
@@ -26,54 +28,74 @@ final class Logger
      */
     public function logDecision(
         string $ip,
-        string $decision,   // 'block' | 'monitor' | 'honeypot'
+        string $decision,
         int $score,
         array $rules,
         array $types,
-        string $mode
+        string $mode,
+        ?string $reference = null,
+        array $evidence = []
     ): void {
         $now = time();
 
         $record = [
-            'ts'        => date('c', $now),
+            'ts'        => gmdate('c', $now),
             'ip'        => $ip,
             'decision'  => $decision,
             'mode'      => $mode,
             'score'     => $score,
             'rule_ids'  => $rules,
             'types'     => $types,
-            'method'    => $_SERVER['REQUEST_METHOD'] ?? '-',
-            'uri'       => $_SERVER['REQUEST_URI'] ?? '-',
-            'host'      => $_SERVER['HTTP_HOST'] ?? '-',
-            'ua'        => $_SERVER['HTTP_USER_AGENT'] ?? '-',
-            'ref'       => $_SERVER['HTTP_REFERER'] ?? '-',
+            'method'    => substr($_SERVER['REQUEST_METHOD'] ?? '-', 0, 16),
+            'uri'       => substr(RequestInput::path(), 0, 512),
+            'reference' => $reference,
+            'evidence'  => $evidence,
         ];
 
-        $this->append($this->jsonLog, json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
+        $this->append($this->jsonLog, json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) . "\n");
+        if ($decision === 'shadow') {
+            return;
+        }
 
         // fail2ban regex target: matches "WAF BLOCK ... IP: <ip>"
         $text = sprintf(
-            "%s | WAF %s | IP: %s | Score: %d | Rules: %s | URI: %s\n",
+            "%s | WAF %s | IP: %s | Score: %d | Rules: %s | Reference: %s\n",
             date('Y-m-d H:i:s', $now),
             strtoupper($decision),
             $ip,
             $score,
             implode(',', $rules) ?: '-',
-            $_SERVER['REQUEST_URI'] ?? '-'
+            $reference ?? '-'
         );
         $this->append($this->textLog, $text);
     }
 
     private function append(string $file, string $line): void
     {
-        $fp = fopen($file, 'a');
-        if ($fp === false) {
-            return;
+        if ($this->maxBytes > 0) {
+            $lock = @fopen($file . '.lock', 'c+b');
+            if ($lock !== false) {
+                try {
+                    if (flock($lock, LOCK_EX)) {
+                        clearstatcache(true, $file);
+                        if (is_file($file) && filesize($file) >= $this->maxBytes) {
+                            @rename($file, $file . '.previous');
+                        }
+                        $this->writeLine($file, $line);
+                    }
+                    return;
+                } finally {
+                    fclose($lock);
+                }
+            }
         }
-        if (flock($fp, LOCK_EX)) {
-            fwrite($fp, $line);
-            flock($fp, LOCK_UN);
+        $this->writeLine($file, $line);
+    }
+
+    private function writeLine(string $file, string $line): void
+    {
+        if (@file_put_contents($file, $line, FILE_APPEND | LOCK_EX) === false) {
+            error_log('[PHPWAF] Could not write a firewall event.');
         }
-        fclose($fp);
     }
 }

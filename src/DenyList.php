@@ -27,7 +27,7 @@ final class DenyList
             return;
         }
 
-        $fp = fopen($this->file, 'c+');
+        $fp = @fopen($this->file, 'c+');
         if ($fp === false) {
             return;
         }
